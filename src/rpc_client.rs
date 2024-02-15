@@ -2,31 +2,15 @@ use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
 use base64::{prelude::BASE64_STANDARD, Engine};
+use bevy::tasks::ParallelSlice;
+#[cfg(feature = "wasm")]
 use gloo_net::http::Request;
-use serde_json::json;
+use serde_json::{json, Value};
 use solana_sdk::{
-    account::Account, bs58, message::Message, pubkey::Pubkey, signature::Keypair,
-    system_instruction, transaction::Transaction,
+    account::Account, account_info::AccountInfo, bs58, message::Message, pubkey::Pubkey,
+    signature::Keypair, system_instruction, transaction::Transaction,
 };
 
-impl From<AccountValue> for Account {
-    fn from(v: AccountValue) -> Self {
-        let data = BASE64_STANDARD.decode(v.data.get(0).unwrap()).unwrap();
-
-        Self {
-            data,
-            executable: v.executable,
-            lamports: v.lamports,
-            owner: Pubkey::from_str(&v.owner).unwrap(),
-            rent_epoch: v.rent_epoch,
-        }
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct ProgramAccountValue {
-    pub account: AccountValue,
-}
 #[derive(serde::Serialize)]
 struct RpcRequest<T> {
     jsonrpc: String,
@@ -61,19 +45,37 @@ struct RpcResult<T> {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AccountValue {
-    data: Vec<String>,
+struct GetLatestBlockhash {
+    blockhash: String,
+    last_valid_block_height: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcAccountInfo {
+    data: [String; 2],
     executable: bool,
     lamports: u64,
     owner: String,
     rent_epoch: u64,
 }
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GetLatestBlockhash {
-    blockhash: String,
-    last_valid_block_height: u64,
+impl From<RpcAccountInfo> for Account {
+    fn from(rpc_acc: RpcAccountInfo) -> Self {
+        let data = BASE64_STANDARD.decode(rpc_acc.data[0].as_bytes()).unwrap();
+        let owner = Pubkey::from_str(&rpc_acc.owner).unwrap();
+        let lamports = rpc_acc.lamports;
+        let rent_epoch = rpc_acc.rent_epoch;
+        let executable = rpc_acc.executable;
+
+        Account {
+            data,
+            owner,
+            lamports,
+            rent_epoch,
+            executable,
+        }
+    }
 }
 
 pub struct RpcClient {
@@ -98,9 +100,18 @@ impl RpcClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T> {
-        let resp_str = Request::post(&self.url)
+        #[cfg(feature = "wasm")]
+        let resp_str: String = Request::post(&self.url)
             .header("Content-Type", "application/json")
             .json(&RpcRequest::new(method, params))?
+            .send()
+            .await?
+            .text()
+            .await?;
+        #[cfg(all(not(feature = "wasm"), feature = "local"))]
+        let resp_str: String = reqwest::Client::new()
+            .post(&self.url)
+            .json(&RpcRequest::new(method, params))
             .send()
             .await?
             .text()
@@ -138,16 +149,14 @@ impl RpcClient {
     }
 
     pub async fn get_account(&self, pubkey: &Pubkey) -> Result<Account> {
-        let opt_acc_val: Option<AccountValue> = self
+        let opt_acc_val: Option<RpcAccountInfo> = self
             .rpc_post_expect_result(
                 "getAccountInfo",
                 json!([pubkey.to_string(), {"encoding": "base64"}]),
             )
             .await?;
 
-        let v = opt_acc_val.context("could not find account")?;
-
-        Ok(v.into())
+        Ok(opt_acc_val.context("could not find account")?.into())
     }
 
     pub async fn send_transaction(&self, tx: &Transaction) -> Result<String> {
@@ -182,17 +191,18 @@ impl RpcClient {
         Ok(hash)
     }
 
-    pub async fn get_program_accounts(&self, program_id: &Pubkey) -> Result<Vec<Account>> {
-        let resp: Vec<ProgramAccountValue> = self
+    pub async fn get_program_accounts(
+        &self,
+        program_id: &Pubkey,
+    ) -> Result<Vec<(Account, Pubkey)>> {
+        let resp: Vec<(Account, Pubkey)> = self
             .rpc_post(
                 "getProgramAccounts",
                 json!([program_id.to_string(), {"encoding": "base64"}]),
             )
             .await?;
 
-        let accounts = resp.into_iter().map(|v| v.account.into()).collect();
-
-        Ok(accounts)
+        Ok(resp.into_iter().map(|(acc, pk)| (acc.into(), pk)).collect())
     }
 }
 
@@ -221,16 +231,28 @@ fn get_local_keypair() -> Result<Keypair> {
     Ok(Keypair::from_bytes(&keypair_bytes)?)
 }
 
-#[cfg(all(test, feature = "wasm"))]
+#[cfg(test)]
 mod wasm_tests {
     use solana_sdk::{pubkey::Pubkey, signer::Signer};
 
     use super::*;
+
+    #[cfg(feature = "wasm")]
     use wasm_bindgen_test::*;
 
-    #[wasm_bindgen_test]
-    async fn test_transfer_send_transaction() -> Result<()> {
+    fn init_logger() {
+        #[cfg(feature = "wasm")]
         wasm_logger::init(wasm_logger::Config::default());
+        #[cfg(all(not(feature = "wasm"), feature = "local"))]
+        let _ =
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+                .try_init();
+    }
+
+    #[cfg_attr(feature = "wasm", wasm_bindgen_test)]
+    #[cfg_attr(all(not(feature = "wasm"), feature = "local"), tokio::test)]
+    async fn test_transfer_send_transaction() -> Result<()> {
+        init_logger();
 
         let pubkey = TEST_KEYPAIR.try_pubkey()?;
 
@@ -247,9 +269,10 @@ mod wasm_tests {
         Ok(())
     }
 
-    #[wasm_bindgen_test]
+    #[cfg_attr(feature = "wasm", wasm_bindgen_test)]
+    #[cfg_attr(all(not(feature = "wasm"), feature = "local"), tokio::test)]
     async fn test_get_account() -> Result<()> {
-        wasm_logger::init(wasm_logger::Config::default());
+        init_logger();
 
         let client = RpcClient::devnet();
         let account_pub = "vines1vzrYbzLMRdu58ou5XTby4qAqVRLmqo36NKPTg";
@@ -260,11 +283,12 @@ mod wasm_tests {
         Ok(())
     }
 
-    #[wasm_bindgen_test]
+    #[cfg_attr(feature = "wasm", wasm_bindgen_test)]
+    #[cfg_attr(all(not(feature = "wasm"), feature = "local"), tokio::test)]
     async fn test_get_program_accounts() -> Result<()> {
-        wasm_logger::init(wasm_logger::Config::default());
+        init_logger();
 
-        let client = RpcClient::local();
+        let client = RpcClient::devnet();
 
         let accounts = client.get_program_accounts(&PROGRAM_ID).await?;
         log::debug!("\n\naccounts: {:?}\n\n", accounts);
