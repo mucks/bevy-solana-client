@@ -1,0 +1,14 @@
+[package]
+name = "bevy-solana-client-common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64 = "0.22"
+bincode = "1"
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+solana-sdk = "2"

@@ -1,12 +1,46 @@
 use std::sync::{Arc, OnceLock, RwLock, RwLockWriteGuard};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bevy::prelude::*;
+use bevy_solana_client_common::rpc_client::{RpcClient, RpcRequest, RpcResponse};
+use gloo_net::http::Request;
 use wasm_bindgen::JsValue;
 
-pub struct WasmClient;
+pub struct WasmRpcClient {
+    pub url: String,
+}
 
-impl Plugin for WasmClient {
+#[async_trait::async_trait(?Send)]
+impl RpcClient for WasmRpcClient {
+    async fn rpc_post<De: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<De> {
+        let resp_str: String = Request::post(&self.url)
+            .header("Content-Type", "application/json")
+            .json(&RpcRequest::new(method, params))?
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        log::debug!("resp_str: {:?}", resp_str);
+        let resp: RpcResponse<De> = serde_json::from_str(&resp_str)?;
+
+        if let Some(e) = resp.error {
+            bail!("rpc error: {:?}", e);
+        }
+
+        let result = resp.result.context("no result")?;
+
+        Ok(result)
+    }
+}
+
+pub struct BevySolanaClientWasm;
+
+impl Plugin for BevySolanaClientWasm {
     fn build(&self, app: &mut App) {
         app.add_event::<WalletEvent>();
         app.insert_resource(Wallet { info: None });
@@ -53,7 +87,7 @@ impl AsyncWalletEventQueue {
         Ok(wallet_event_queue.pop())
     }
 
-    fn clear() -> Result<()> {
+    fn _clear() -> Result<()> {
         let mut wallet_event_queue = Self::get_rw_lock()?;
         wallet_event_queue.clear();
         Ok(())
@@ -92,9 +126,9 @@ pub enum WalletButtonType {
 #[derive(Debug, Component)]
 pub struct WalletMenu;
 
-const NORMAL_BUTTON: Color = Color::rgb(0.15, 0.15, 0.15);
-const HOVERED_BUTTON: Color = Color::rgb(0.25, 0.25, 0.25);
-const PRESSED_BUTTON: Color = Color::rgb(0.35, 0.75, 0.35);
+const NORMAL_BUTTON: Color = Color::linear_rgb(0.15, 0.15, 0.15);
+const HOVERED_BUTTON: Color = Color::linear_rgb(0.25, 0.25, 0.25);
+const PRESSED_BUTTON: Color = Color::linear_rgb(0.35, 0.75, 0.35);
 
 fn async_wallet_event_system(mut ev_writer: EventWriter<WalletEvent>, mut wallet: ResMut<Wallet>) {
     if let Ok(Some(event)) = AsyncWalletEventQueue::pop() {
@@ -123,7 +157,7 @@ fn wallet_menu_system(
         (With<ConnectDisconnectBtnText>, Without<WalletMenu>),
     >,
 ) {
-    for event in ev_reader.iter() {
+    for event in ev_reader.read() {
         match event {
             WalletEvent::Connected => {
                 debug!("WalletEvent::Connected");
@@ -146,23 +180,20 @@ fn wallet_menu_system(
 }
 
 fn wallet_event_system(
-    mut commands: Commands,
+    mut _commands: Commands,
     mut ev_reader: EventReader<WalletEvent>,
-    mut wallet: ResMut<Wallet>,
+    mut _wallet: ResMut<Wallet>,
 ) {
-    for event in ev_reader.iter() {
-        match event {
-            WalletEvent::ConnectBtnClick => {
-                debug!("WalletEvent::ConnectBtnClick");
+    for event in ev_reader.read() {
+        if let WalletEvent::ConnectBtnClick = event {
+            debug!("WalletEvent::ConnectBtnClick");
 
-                wasm_bindgen_futures::spawn_local(async move {
-                    AsyncWalletEventQueue::push(AsyncWalletEvent::ConnectionCompleted(
-                        connect_to_phantom().await,
-                    ))
-                    .unwrap();
-                });
-            }
-            _ => {}
+            wasm_bindgen_futures::spawn_local(async move {
+                AsyncWalletEventQueue::push(AsyncWalletEvent::ConnectionCompleted(
+                    connect_to_phantom().await,
+                ))
+                .unwrap();
+            });
         }
     }
 }
@@ -171,11 +202,11 @@ async fn connect_to_phantom() -> Result<String> {
     debug!("connect_to_wallet");
     let window = web_sys::window().context("could not get window")?;
     if let Some(solana) = window.get("solana") {
-        let is_phantom = reflect_get(&*solana, &wasm_bindgen::JsValue::from_str("isPhantom"))?;
+        let is_phantom = reflect_get(&solana, &wasm_bindgen::JsValue::from_str("isPhantom"))?;
 
-        if is_phantom == JsValue::from(true) {
+        if is_phantom == true {
             let connect_str = wasm_bindgen::JsValue::from_str("connect");
-            let connect: js_sys::Function = reflect_get(&*solana, &connect_str)?.into();
+            let connect: js_sys::Function = reflect_get(&solana, &connect_str)?.into();
 
             debug!("{:?}", connect.to_string());
 
@@ -215,6 +246,7 @@ async fn connect_to_phantom() -> Result<String> {
     Err(anyhow!("could not connect to wallet"))
 }
 
+#[allow(clippy::type_complexity)]
 pub fn wallet_menu_interaction_system(
     mut interaction_query: Query<
         (
@@ -233,7 +265,7 @@ pub fn wallet_menu_interaction_system(
         match *interaction {
             Interaction::Pressed => {
                 *color = PRESSED_BUTTON.into();
-                border_color.0 = Color::RED;
+                border_color.0 = Color::linear_rgb(255., 0., 0.);
             }
             Interaction::Hovered => {
                 *color = HOVERED_BUTTON.into();
@@ -288,7 +320,7 @@ pub fn setup_wallet_menu(mut commands: Commands) {
                     "",
                     TextStyle {
                         font_size: 40.0,
-                        color: Color::rgb(0.9, 0.9, 0.9),
+                        color: Color::linear_rgb(0.9, 0.9, 0.9),
                         ..Default::default()
                     },
                 ))
@@ -317,7 +349,7 @@ pub fn setup_wallet_menu(mut commands: Commands) {
                             "Connect",
                             TextStyle {
                                 font_size: 40.0,
-                                color: Color::rgb(0.9, 0.9, 0.9),
+                                color: Color::linear_rgb(0.9, 0.9, 0.9),
                                 ..Default::default()
                             },
                         ))

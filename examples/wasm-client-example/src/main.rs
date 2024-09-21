@@ -3,6 +3,6 @@ use bevy::prelude::*;
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .add_plugins(bevy_solana_client::BevySolanaClient)
+        .add_plugins(bevy_solana_client_wasm::BevySolanaClientWasm)
         .run();
 }
